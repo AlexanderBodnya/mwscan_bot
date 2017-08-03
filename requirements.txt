@@ -1,0 +1,5 @@
+flask
+telepot
+gunicorn
+requests
+
