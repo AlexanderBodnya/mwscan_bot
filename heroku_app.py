@@ -2,20 +2,35 @@ import os
 from flask import Flask, request
 import telepot
 from telepot.loop import OrderedWebhook
-from telepot.delegate import (
-    per_chat_id_in,
-    per_application,
-    call,
-    create_open,
-    pave_event_space
-    )
+from telepot.delegate import call
 import requests
 import time
 import os
 import threading
 import queue
+import hashlib
 
-VT_API_KEY = 'your VT_API_KEY'
+HELP_MESSAGE = "Here's the list of available commands: \n /start - display welcome message \n /help - display this message \n /hash [md5/sha1/sha256] - check hash against Virus Total databases \n Send file to check it against VT databases"
+WELCOME_MESSAGE = "Hello! I'm a bot, which scans files, using Virus Total API. You can use /help command to access help message or just send me a sample, which you want to check"
+SCANFILE_MESSAGE = "I will try to scan this file, using the Virus Total service. This may take a few minutes, due to Virus Total public API limitations. File name is "
+
+VT_API_KEY = 'Virus Total API Key'
+
+
+print(threading.current_thread())
+
+def md5(fname):
+    hash_md5 = hashlib.md5()
+    with open(fname, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+    
+def downloader(response,filename):
+    response.raise_for_status()
+    with open(filename, 'wb') as handle:
+        for block in response.iter_content(1024):
+            handle.write(block)
 
 class VirusTotalFileScan():
     
@@ -27,51 +42,63 @@ class VirusTotalFileScan():
         files = {
             'file': (filename, open(filename, 'rb'))
         }
-        response = requests.post('https://www.virustotal.com/vtapi/v2/file/scan', files=files, data=params)
-        return response
+        hash_file = md5(filename)
+       
+        while True:
+            time.sleep(2)
+            response = requests.post('https://www.virustotal.com/vtapi/v2/file/scan', files=files, data=params)
+            if response.status_code ==200:
+                json_response = response.json()
+                if json_response['response_code'] == 0:
+                    break
+                elif json_response['response_code'] == 1:
+                    break
         
-    def vt_scan_response(self, VT_API_KEY, scan_id):
+        return (json_response,hash_file)
+        
+    def vt_scan_response(self, VT_API_KEY, resource):
         headers = {
             "Accept-Encoding": "gzip, deflate",
             "User-Agent" : "gzip, VT_test"
         }
         params = {
             'apikey': VT_API_KEY,
-            'resource':scan_id,
+            'resource':resource,
         }
-        response = requests.post('https://www.virustotal.com/vtapi/v2/file/report',
-            params=params, 
-            headers=headers)
-        return response
-            
-    def scan_procedure(self, filename):
-        while True:
-            if self.vt_scan_request(self.VT_API_KEY, filename).status_code == 200:
-                try:
-                    json_response = self.vt_scan_request(self.VT_API_KEY, filename).json()
-                    if json_response['response_code'] == 0:
-                        break
-                    elif json_response['response_code'] == 1:
-                        break
-                    else:
-                        continue
-                except:
-                    continue
-        scan_id = json_response['scan_id']
         
         while True:
-             time.sleep(10)
-             if self.vt_scan_response(self.VT_API_KEY, scan_id).status_code == 200: 
-                try:
-                    response = self.vt_scan_response(self.VT_API_KEY, scan_id)
-                    json_response = response.json()
-                    if json_response['response_code'] == 1:
-                        break
-                    else:
-                        continue
-                except:
-                    continue
+            response = requests.post('https://www.virustotal.com/vtapi/v2/file/report',
+            params=params, 
+            headers=headers)
+            time.sleep(10)
+            if response.status_code ==200:
+                json_response = response.json()
+                print(json_response)
+                if json_response['response_code'] == 0:
+                    json_response = 0
+                elif json_response['response_code'] == 1:
+                    break
+               
         return json_response
+
+    def scan_procedure(self, filename):
+        json_response, hash_file = self.vt_scan_request(self.VT_API_KEY, filename)
+        json_response = self.vt_scan_response(self.VT_API_KEY, hash_file)
+
+        return json_response
+        
+    def results_parser(self,json_response):
+        if json_response['response_code'] == 1:
+            positives = json_response['positives']
+            total = json_response['total']
+            permalink = json_response['permalink']
+            
+            return (positives, total, permalink)
+        
+        else:
+            
+            return json_response['response_code']
+        
 
 
 
@@ -94,9 +121,9 @@ def threading_wrapper(func):
 
 
 class ChatBox(telepot.DelegatorBot):
-    def __init__(self, token, queue):
+    def __init__(self, token):
         self._seen = set()
-        self._queue = queue
+        self._queue = queue.Queue()
         super(ChatBox, self).__init__(
             token,[
            
@@ -120,43 +147,85 @@ class ChatBox(telepot.DelegatorBot):
         self._seen.add(chat_id)
         return []
         
+    def help_message(self, chat_id, *args):
+         BOT.sendMessage(chat_id, str(HELP_MESSAGE))
+         return 0
+         
+    def welcome_message(self, chat_id, *args):
+         BOT.sendMessage(chat_id, str(WELCOME_MESSAGE))
+         return 0
+         
+    def hash_command(self, chat_id, hash_value = None):
+        if hash_value == None:
+            BOT.sendMessage(chat_id,'Missing hash value!')
+            return 0
+        BOT.sendMessage(chat_id,'I will try to check this hash against Virus Total bases')
+        filescan = VirusTotalFileScan(VT_API_KEY)
+        results = filescan.vt_scan_response(filescan.VT_API_KEY,hash_value)
+        print(results)
+        parsed_results = filescan.results_parser(results)
+        print(parsed_results)
+        if type(results) != int:
+            BOT.sendMessage(chat_id, "Your hash "+str(hash_value)+" was detected by "+ str(parsed_results[0])+" of "+str(parsed_results[1])+" vendors. More verbose information you can find following this link - "+parsed_results[2] )
+        else:
+            BOT.sendMessage(chat_id, "Error occured during hash retrieval, try again later") 
+    
+    commands_dict = {
+        '/help' : help_message,
+        '/start' : welcome_message,
+        '/hash' : hash_command
+    }
+    
     def on_chat_message(self, seed_tuple):
-        content_type, chat_type, chat_id = telepot.glance(seed_tuple[1])
-        if content_type == 'text':    
-            BOT.sendMessage(chat_id, 'I\'m bot which scans files for malware, please send me file and I will scan it. File size should not exceed 20 mb. Also - please avoid special symbols in names')
-        elif content_type == 'document':
-            file_id = seed_tuple[1]['document']['file_id']
-            print(BOT.getFile(file_id))
+        msg = seed_tuple[1]
+        content_type, chat_type, chat_id = telepot.glance(msg)
+        print(chat_id)
+
+        if content_type =='document':
+            file_id = msg['document']['file_id']
             file = BOT.getFile(file_id)
-            BOT.sendMessage(chat_id,"I will try to scan this file, using the Virus Total service. This may take a few minutes, due to Virus Total public API limitations. File name is "+str(file['file_path'])[10:])
+            BOT.sendMessage(chat_id,SCANFILE_MESSAGE+str(file['file_path'])[10:])
             response = requests.get("https://api.telegram.org/file/bot"+TOKEN+'/'+file['file_path'], stream=True)
-            # Throw an error for bad status codes
-            response.raise_for_status()
-            with open(file['file_id'], 'wb') as handle:
-                for block in response.iter_content(1024):
-                    handle.write(block)
+            url = "https://api.telegram.org/file/bot"+TOKEN+'/'+file['file_path']
+            self._queue.put(url, block = True)
+            downloader(response,file['file_id'])
             filescan = VirusTotalFileScan(VT_API_KEY)
             results = filescan.scan_procedure(file['file_id'])
-            if results['positives'] == 0:
-                BOT.sendMessage(chat_id, "Your file " + str(file['file_path'])[10:] + " is clean!")
+            parsed_results = filescan.results_parser(results)
+            if type(parsed_results) != int:
+                BOT.sendMessage(chat_id, "Your file "+str(file['file_path'])[10:]+" was detected by "+ str(parsed_results[0])+" of "+str(parsed_results[1])+" vendors. More verbose information you can find following this link - "+parsed_results[2])
             else:
-                BOT.sendMessage(chat_id, "Your file"+str(file['file_path'])[10:]+" was detected by "+ str(results['positives'])+" of "+str(results['total'])+" vendors. More verbose information you can find following this link - "+results['permalink'] )
+                BOT.sendMessage(chat_id, "Error occured during data retrieval, try again later")
             os.remove(file['file_id'])
+        elif content_type == 'text':
+            text = msg['text']
+            words = text.split()
+            try:
+                self.commands_dict[words[0]](self, chat_id, words[1])
+            except:
+                self.commands_dict[words[0]](self, chat_id)
+        else:
+            BOT.sendMessage(chat_id,"I don't understand")
+    
+   
+
         
 app = Flask(__name__)
 
-os.environ['PP_BOT_TOKEN'] = 'TOKEN' # put your token in heroku app as environment variable
+os.environ['PP_BOT_TOKEN'] = '' # put your token in heroku app as environment variable
 TOKEN = os.environ['PP_BOT_TOKEN']
 
 SECRET = '/bot' + TOKEN
-URL = 'URL' #  paste the url of your application
+URL = '' #  paste the url of your application
 
-inbound_queue = queue.Queue()
-outbound_queue = queue.Queue()
 
-BOT = ChatBox(TOKEN, inbound_queue)
+
+BOT = ChatBox(TOKEN)
+bot = telepot.Bot(TOKEN)
+
 
 webhook = OrderedWebhook(BOT)
+
 
 @app.route(SECRET, methods=['GET', 'POST'])
 def pass_update():
@@ -168,5 +237,11 @@ try:
 except telepot.exception.TooManyRequestsError:
     pass
 
+
+
 webhook.run_as_thread()
+
+
+    
+
 
